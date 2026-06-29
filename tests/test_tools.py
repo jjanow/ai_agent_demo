@@ -1,5 +1,6 @@
 """Tests for agent.tools."""
 
+import multiprocessing
 import time
 from types import SimpleNamespace
 
@@ -181,11 +182,27 @@ def test_dispatch_bad_input_type():
     assert res["success"] is False
 
 
-def test_dispatch_timeout_does_not_block(monkeypatch):
+def test_dispatch_runs_tool_in_process():
+    # Exercises the real (default "spawn") process round-trip end to end:
+    # the child re-imports the registry, runs the tool, and returns via the queue.
+    res = tools.dispatch_tool("calculator", {"expression": "2 + 2"})
+    assert res["success"] is True
+    assert res["result"]["value"] == 4
+
+
+@pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
+def test_dispatch_timeout_kills_runaway_tool(monkeypatch):
+    # Use "fork" so the child inherits the monkeypatched registry (a closure
+    # cannot be pickled to a "spawn" child). The runaway tool must be terminated,
+    # not merely abandoned, so the call returns promptly.
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("fork start method is unavailable on this platform")
+
     def _slow() -> dict:
-        time.sleep(5)
+        time.sleep(30)
         return tools._ok({"done": True})
 
+    monkeypatch.setattr(tools, "MP_START_METHOD", "fork")
     monkeypatch.setitem(tools._TOOL_FUNCS, "slow", _slow)
 
     start = time.perf_counter()
@@ -194,4 +211,4 @@ def test_dispatch_timeout_does_not_block(monkeypatch):
 
     assert res["success"] is False
     assert "timed out" in res["error"].lower()
-    assert elapsed < 2.0
+    assert elapsed < 5.0

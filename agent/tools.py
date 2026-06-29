@@ -6,14 +6,17 @@ Every tool:
   * never raises out to the caller (all exceptions are caught), and
   * is logged via loguru with latency.
 
-Tool execution is wrapped with a hard timeout (config.tool_timeout_s). Because
-Python threads cannot be force-killed, a timed-out tool returns a timeout error
-as its result; the underlying work is abandoned.
+Tool execution is wrapped with a hard timeout (config.tool_timeout_s). Each tool
+runs in a separate, short-lived process; if it overruns the timeout the process
+is terminated (SIGTERM, then SIGKILL), so a runaway tool's CPU/memory work is
+actually reclaimed rather than leaked into the background. A timed-out tool
+returns a structured timeout error.
 """
 
 from __future__ import annotations
 
-import threading
+import multiprocessing
+import queue as queue_mod
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -291,15 +294,61 @@ def _summarize_result(result: dict) -> str:
     return f"error: {result.get('error')}"
 
 
+# Process start method for tool isolation. "spawn" is the safe default: it does
+# not inherit the parent's threads/locks (important under Streamlit), at the cost
+# of re-importing this module in the child. Overridable for tests.
+MP_START_METHOD = "spawn"
+
+# How long to wait for a terminated worker to die before escalating to SIGKILL.
+_REAP_GRACE_S = 1.0
+
+
+def _tool_worker(name: str, tool_input: dict, out_queue: Any) -> None:
+    """Run a tool in a child process and put its structured result on a queue.
+
+    Looks the tool up by name in the registry (rather than receiving the callable
+    by reference) so it works under both "spawn" (fresh re-import) and "fork"
+    (inherited registry) start methods.
+    """
+    try:
+        func = _TOOL_FUNCS.get(name)
+        if func is None:
+            out_queue.put(_err(f"Unknown tool: {name}"))
+            return
+        try:
+            out_queue.put(func(**tool_input))
+        except TypeError as exc:
+            out_queue.put(_err(f"Invalid arguments for '{name}': {exc}"))
+        except Exception as exc:  # noqa: BLE001 - tools must never raise out
+            out_queue.put(_err(f"Tool '{name}' raised unexpectedly: {exc}"))
+    except Exception:  # noqa: BLE001 - last-resort guard; never hang the parent
+        try:
+            out_queue.put(_err(f"Tool '{name}' failed in its worker process."))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _reap(process: Any) -> None:
+    """Terminate a still-running worker, escalating SIGTERM -> SIGKILL."""
+    if process.is_alive():
+        process.terminate()
+        process.join(_REAP_GRACE_S)
+    if process.is_alive():
+        process.kill()
+        process.join(_REAP_GRACE_S)
+
+
 def dispatch_tool(name: str, tool_input: dict, timeout_s: float | None = None) -> dict:
     """Execute a tool by name with a hard timeout, logging the call.
 
-    Always returns a structured {"success", "result", "error"} dict; never raises.
+    The tool runs in an isolated child process so a runaway tool can be truly
+    killed on timeout (reclaiming its CPU/memory) instead of leaking. Always
+    returns a structured {"success", "result", "error"} dict; never raises.
     """
     timeout_s = timeout_s if timeout_s is not None else get_settings().tool_timeout_s
-    func = _TOOL_FUNCS.get(name)
 
-    if func is None:
+    # Fast-path validation in the parent to avoid spawning a process needlessly.
+    if _TOOL_FUNCS.get(name) is None:
         result = _err(f"Unknown tool: {name}")
         log_tool_call(name, tool_input, _summarize_result(result), 0.0, False)
         return result
@@ -309,30 +358,30 @@ def dispatch_tool(name: str, tool_input: dict, timeout_s: float | None = None) -
         log_tool_call(name, tool_input, _summarize_result(result), 0.0, False)
         return result
 
-    # Run the tool in a daemon thread so a runaway tool cannot block us: we join
-    # with a timeout and, if it overruns, abandon the thread (it dies with the
-    # process). ThreadPoolExecutor is unsuitable here because its context-exit
-    # calls shutdown(wait=True), which would block until the tool finishes.
-    container: dict[str, Any] = {}
-
-    def _runner() -> None:
-        try:
-            container["result"] = func(**tool_input)
-        except TypeError as exc:
-            container["result"] = _err(f"Invalid arguments for '{name}': {exc}")
-        except Exception as exc:  # noqa: BLE001 - tools must never raise out
-            container["result"] = _err(f"Tool '{name}' raised unexpectedly: {exc}")
-
     start = time.perf_counter()
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
-    thread.join(timeout_s)
+    try:
+        ctx = multiprocessing.get_context(MP_START_METHOD)
+        out_queue = ctx.Queue()
+        process = ctx.Process(
+            target=_tool_worker, args=(name, tool_input, out_queue), daemon=True
+        )
+        process.start()
+    except Exception as exc:  # noqa: BLE001 - process machinery unavailable
+        result = _err(f"Tool '{name}' could not be launched: {exc}")
+        log_tool_call(name, tool_input, _summarize_result(result), 0.0, False)
+        return result
 
-    if thread.is_alive():
-        # Daemon thread intentionally leaks; do not wait for it to finish.
-        result = _err(f"Tool '{name}' timed out after {timeout_s:.0f}s.")
-    else:
-        result = container.get("result", _err(f"Tool '{name}' produced no result."))
+    try:
+        # Drain the result first (avoids the join-before-drain queue deadlock).
+        result = out_queue.get(timeout=timeout_s)
+    except queue_mod.Empty:
+        if process.is_alive():
+            result = _err(f"Tool '{name}' timed out after {timeout_s:.0f}s.")
+        else:
+            result = _err(f"Tool '{name}' exited without returning a result.")
+    finally:
+        _reap(process)
+        out_queue.close()
 
     latency_ms = (time.perf_counter() - start) * 1000.0
     if not isinstance(result, dict) or "success" not in result:

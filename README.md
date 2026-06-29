@@ -141,9 +141,10 @@ are required.
 
 - `web_search` requires a Tavily API key; it degrades gracefully (returns a
   structured error) when the key is absent.
-- Per-tool timeouts run work on a worker thread. Because Python threads cannot
-  be force-killed, a timed-out tool returns a timeout error while the abandoned
-  work may continue briefly in the background.
+- Per-tool timeouts run each tool in an isolated child process (default start
+  method `spawn`). On timeout the process is terminated (SIGTERM, then SIGKILL),
+  so a runaway tool's CPU/memory work is actually reclaimed rather than leaked.
+  The trade-off is a small per-call process-startup cost.
 - Token counting for the memory budget is a cheap `chars / 4` estimate, not a
   true tokenizer count.
 - The calculator parses expressions with an AST whitelist (no `eval`/`exec`),
