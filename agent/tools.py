@@ -13,20 +13,19 @@ as its result; the underlying work is abandoned.
 
 from __future__ import annotations
 
-import math
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from loguru import logger
 
-from config import settings
+from config import get_settings
 from utils.logging import log_tool_call
 from utils.safety import (
+    safe_eval_math,
     safe_resolve_path,
-    validate_calculator_expression,
 )
 
 # --------------------------------------------------------------------------- #
@@ -52,13 +51,14 @@ def web_search(query: str) -> dict:
     if not isinstance(query, str) or not query.strip():
         return _err("`query` must be a non-empty string.")
 
-    if not settings.tavily_api_key:
+    cfg = get_settings()
+    if not cfg.tavily_api_key:
         return _err("TAVILY_API_KEY is not configured; web_search is unavailable.")
 
     try:
         from tavily import TavilyClient
 
-        client = TavilyClient(api_key=settings.tavily_api_key)
+        client = TavilyClient(api_key=cfg.tavily_api_key)
         response = client.search(query=query.strip(), max_results=3)
         results = []
         for item in (response or {}).get("results", [])[:3]:
@@ -77,30 +77,11 @@ def web_search(query: str) -> dict:
 
 
 def calculator(expression: str) -> dict:
-    """Evaluate a math expression using only the math module (no arbitrary code)."""
-    guard = validate_calculator_expression(expression)
-    if not guard.ok:
-        return _err(guard.error or "Invalid expression.")
-
-    # Restricted namespace: only whitelisted math helpers, no builtins.
-    allowed = {
-        "sqrt": math.sqrt,
-        "sin": math.sin,
-        "cos": math.cos,
-        "tan": math.tan,
-        "log": math.log,
-        "pow": math.pow,
-        "abs": abs,
-        "pi": math.pi,
-        "e": math.e,
-    }
-    try:
-        value = eval(guard.value, {"__builtins__": {}}, allowed)  # noqa: S307 - sandboxed
-        return _ok({"expression": guard.value, "value": value})
-    except ZeroDivisionError:
-        return _err("Division by zero.")
-    except Exception as exc:  # noqa: BLE001
-        return _err(f"Could not evaluate expression: {exc}")
+    """Evaluate a math expression via the safe AST evaluator (no arbitrary code)."""
+    ok, value, error = safe_eval_math(expression)
+    if not ok:
+        return _err(error or "Invalid expression.")
+    return _ok({"expression": (expression or "").strip(), "value": value})
 
 
 def get_datetime() -> dict:
@@ -168,19 +149,20 @@ def summarize_text(text: str) -> dict:
     if not isinstance(text, str) or not text.strip():
         return _err("`text` must be a non-empty string.")
 
-    if not settings.anthropic_api_key:
+    cfg = get_settings()
+    if not cfg.anthropic_api_key:
         return _err("ANTHROPIC_API_KEY is not configured; summarize_text is unavailable.")
 
     try:
         from anthropic import Anthropic
 
-        client = Anthropic(api_key=settings.anthropic_api_key)
+        client = Anthropic(api_key=cfg.anthropic_api_key, timeout=cfg.api_timeout_s)
         prompt = (
             "Summarize the following text concisely, preserving key facts and "
             "numbers. Use at most 5 sentences.\n\n" + text[:50_000]
         )
         resp = client.messages.create(
-            model=settings.anthropic_model,
+            model=cfg.anthropic_model,
             max_tokens=512,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -314,7 +296,7 @@ def dispatch_tool(name: str, tool_input: dict, timeout_s: float | None = None) -
 
     Always returns a structured {"success", "result", "error"} dict; never raises.
     """
-    timeout_s = timeout_s if timeout_s is not None else settings.tool_timeout_s
+    timeout_s = timeout_s if timeout_s is not None else get_settings().tool_timeout_s
     func = _TOOL_FUNCS.get(name)
 
     if func is None:
@@ -327,17 +309,30 @@ def dispatch_tool(name: str, tool_input: dict, timeout_s: float | None = None) -
         log_tool_call(name, tool_input, _summarize_result(result), 0.0, False)
         return result
 
+    # Run the tool in a daemon thread so a runaway tool cannot block us: we join
+    # with a timeout and, if it overruns, abandon the thread (it dies with the
+    # process). ThreadPoolExecutor is unsuitable here because its context-exit
+    # calls shutdown(wait=True), which would block until the tool finishes.
+    container: dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            container["result"] = func(**tool_input)
+        except TypeError as exc:
+            container["result"] = _err(f"Invalid arguments for '{name}': {exc}")
+        except Exception as exc:  # noqa: BLE001 - tools must never raise out
+            container["result"] = _err(f"Tool '{name}' raised unexpectedly: {exc}")
+
     start = time.perf_counter()
-    try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(lambda: func(**tool_input))
-            result = future.result(timeout=timeout_s)
-    except FutureTimeout:
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+
+    if thread.is_alive():
+        # Daemon thread intentionally leaks; do not wait for it to finish.
         result = _err(f"Tool '{name}' timed out after {timeout_s:.0f}s.")
-    except TypeError as exc:
-        result = _err(f"Invalid arguments for '{name}': {exc}")
-    except Exception as exc:  # noqa: BLE001
-        result = _err(f"Tool '{name}' raised unexpectedly: {exc}")
+    else:
+        result = container.get("result", _err(f"Tool '{name}' produced no result."))
 
     latency_ms = (time.perf_counter() - start) * 1000.0
     if not isinstance(result, dict) or "success" not in result:

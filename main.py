@@ -20,6 +20,7 @@ from agent.loop import Agent
 from agent.memory import ConversationMemory
 from agent.prompts import get_system_prompt
 from utils.logging import setup_logging
+from utils.safety import redact_secrets
 
 st.set_page_config(page_title="Aria — Mini Claude", page_icon="*", layout="wide")
 
@@ -55,6 +56,21 @@ def _init_state() -> None:
         st.session_state.last_iterations = 0
 
 
+def _redact_obj(obj):
+    """Recursively redact secrets from every string in a dict/list/str structure.
+
+    Returns a new structure; the original is left untouched. Tool inputs and
+    results can contain file contents or leaked keys, so redact before display.
+    """
+    if isinstance(obj, str):
+        return redact_secrets(obj)
+    if isinstance(obj, dict):
+        return {k: _redact_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_obj(v) for v in obj]
+    return obj
+
+
 def _render_tool_expanders(tools: list[dict]) -> None:
     for call in tools:
         name = call.get("name", "tool")
@@ -62,9 +78,9 @@ def _render_tool_expanders(tools: list[dict]) -> None:
         label = f"{'✓' if ok else '✗'} tool: {name}"
         with st.expander(label, expanded=False):
             st.markdown("**Input**")
-            st.json(call.get("input", {}))
+            st.json(_redact_obj(call.get("input", {})))
             st.markdown("**Result**")
-            st.json(call.get("result", {}))
+            st.json(_redact_obj(call.get("result", {})))
 
 
 def _render_history() -> None:

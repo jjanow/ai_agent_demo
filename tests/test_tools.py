@@ -1,5 +1,6 @@
 """Tests for agent.tools."""
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -40,6 +41,11 @@ def test_calculator_empty_string():
     res = tools.calculator("")
     assert res["success"] is False
     assert "empty" in res["error"].lower()
+
+
+def test_calculator_huge_exponent():
+    res = tools.calculator("9 ** 99999")
+    assert res["success"] is False
 
 
 # --------------------------------------------------------------------------- #
@@ -132,7 +138,7 @@ class _FakeTavilyFail:
 
 
 def test_web_search_mocked(monkeypatch):
-    monkeypatch.setattr(tools, "settings", SimpleNamespace(tavily_api_key="x"))
+    monkeypatch.setattr(tools, "get_settings", lambda: SimpleNamespace(tavily_api_key="x"))
     monkeypatch.setattr("tavily.TavilyClient", _FakeTavilyOK)
     res = tools.web_search("python news")
     assert res["success"] is True
@@ -141,7 +147,7 @@ def test_web_search_mocked(monkeypatch):
 
 
 def test_web_search_api_failure(monkeypatch):
-    monkeypatch.setattr(tools, "settings", SimpleNamespace(tavily_api_key="x"))
+    monkeypatch.setattr(tools, "get_settings", lambda: SimpleNamespace(tavily_api_key="x"))
     monkeypatch.setattr("tavily.TavilyClient", _FakeTavilyFail)
     res = tools.web_search("python news")
     assert res["success"] is False
@@ -149,7 +155,7 @@ def test_web_search_api_failure(monkeypatch):
 
 
 def test_web_search_missing_key(monkeypatch):
-    monkeypatch.setattr(tools, "settings", SimpleNamespace(tavily_api_key=""))
+    monkeypatch.setattr(tools, "get_settings", lambda: SimpleNamespace(tavily_api_key=""))
     res = tools.web_search("python news")
     assert res["success"] is False
 
@@ -173,3 +179,19 @@ def test_dispatch_unknown_tool():
 def test_dispatch_bad_input_type():
     res = tools.dispatch_tool("calculator", "not a dict")
     assert res["success"] is False
+
+
+def test_dispatch_timeout_does_not_block(monkeypatch):
+    def _slow() -> dict:
+        time.sleep(5)
+        return tools._ok({"done": True})
+
+    monkeypatch.setitem(tools._TOOL_FUNCS, "slow", _slow)
+
+    start = time.perf_counter()
+    res = tools.dispatch_tool("slow", {}, timeout_s=0.2)
+    elapsed = time.perf_counter() - start
+
+    assert res["success"] is False
+    assert "timed out" in res["error"].lower()
+    assert elapsed < 2.0

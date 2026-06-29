@@ -106,7 +106,12 @@ class ConversationMemory:
         )
 
     def import_json(self, data: str) -> None:
-        payload = json.loads(data)
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid session data.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid session data.")
         self.session_id = payload.get("session_id", self.session_id)
         self.system_prompt = payload.get("system_prompt", self.system_prompt)
         self.token_budget = payload.get("token_budget", self.token_budget)
@@ -123,7 +128,11 @@ class ConversationMemory:
         path = self.persist_dir / f"{session_id}.json"
         if not path.exists():
             return False
-        self.import_json(path.read_text(encoding="utf-8"))
+        try:
+            self.import_json(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to load session {}: {}", session_id, exc)
+            return False
         return True
 
     # ------------------------------------------------------------------ #
@@ -160,17 +169,28 @@ class ConversationMemory:
         return len(str(content))
 
     def _enforce_budget(self) -> None:
-        """Drop oldest non-system messages until under the token budget."""
+        """Drop oldest non-system messages until under the token budget.
+
+        The Anthropic API requires the conversation to start with a plain user
+        message (not a leading assistant message and not an orphaned
+        tool_result-only user message), so after trimming for size we repair the
+        front of the history. At least the most recent message is always kept.
+        """
         if self.estimate_tokens() <= self.token_budget:
             return
 
         trimmed = 0
-        while self.messages and self.estimate_tokens() > self.token_budget:
+        while len(self.messages) > 1 and self.estimate_tokens() > self.token_budget:
             self.messages.pop(0)
             trimmed += 1
 
-        # Avoid leaving a dangling tool_result as the first message.
-        while self.messages and self._is_tool_result_message(self.messages[0]):
+        # Repair the front so the first message is a valid conversation start:
+        # drop a leading assistant message or an orphaned tool_result-only user
+        # message, always keeping at least the most recent message.
+        while len(self.messages) > 1 and (
+            self.messages[0].get("role") != "user"
+            or self._is_tool_result_message(self.messages[0])
+        ):
             self.messages.pop(0)
             trimmed += 1
 

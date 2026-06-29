@@ -81,3 +81,31 @@ def test_clear():
     mem.add_user("hello")
     mem.clear()
     assert mem.get_history() == []
+
+
+def test_trimming_keeps_valid_conversation_start():
+    mem = ConversationMemory(system_prompt="system", token_budget=260)
+    mem.add_user("x" * 250)
+    mem.add_assistant(
+        [{"type": "tool_use", "id": "a", "name": "calculator", "input": {}}]
+    )
+    mem.add_tool_result("a", {"value": 1})
+    # More turns force trimming; ending on a user message means the surviving
+    # window starts with a leading assistant message that must be repaired away.
+    for _ in range(5):
+        mem.add_assistant("z" * 250)
+        mem.add_user("y" * 250)
+
+    history = mem.get_history()
+    assert history
+    first = history[0]
+    assert first.get("role") == "user"
+    assert not mem._is_tool_result_message(first)
+
+
+def test_load_returns_false_on_malformed_json(tmp_path):
+    mem = ConversationMemory(persist_dir=tmp_path)
+    (tmp_path / f"{mem.session_id}.json").write_text(
+        "{not valid json", encoding="utf-8"
+    )
+    assert mem.load(mem.session_id) is False

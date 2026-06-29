@@ -187,6 +187,7 @@ class Agent:
         if state.get("error") and state.get("stop_reason") == "input_rejected":
             return {"exceeded": True}
 
+        prev_stop = state.get("stop_reason")
         iteration = state.get("iteration", 0)
         if iteration >= self.settings.max_iterations:
             logger.warning("Max iterations ({}) reached.", self.settings.max_iterations)
@@ -217,7 +218,21 @@ class Agent:
         blocks = self._blocks_to_dicts(getattr(message, "content", []) or [])
         log_iteration(iteration, stop_reason)
 
-        # Persist the assistant turn (text and/or tool_use) verbatim.
+        # Drop malformed tool_use blocks (missing a truthy id or name) BEFORE
+        # persisting. Otherwise they land in history with no matching
+        # tool_result, violating the Anthropic API contract (every tool_use must
+        # be answered by a tool_result on the next turn) and 400-ing the next
+        # real call. Filtered blocks simply vanish; routing then lets the model
+        # recover (see _route_after_reasoning).
+        kept_blocks: list[dict] = []
+        for b in blocks:
+            if b.get("type") == "tool_use" and not (b.get("id") and b.get("name")):
+                logger.warning("Filtering malformed tool_use block: {}", b)
+                continue
+            kept_blocks.append(b)
+        blocks = kept_blocks
+
+        # Persist the assistant turn (text and/or well-formed tool_use) verbatim.
         self.memory.add_assistant(blocks)
 
         text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
@@ -227,11 +242,19 @@ class Agent:
         in_tok = getattr(usage, "input_tokens", 0) or 0
         out_tok = getattr(usage, "output_tokens", 0) or 0
 
+        # Accumulate text across consecutive max_tokens continuations so the
+        # earlier (truncated) segments survive into the final answer rather than
+        # being overwritten by the last segment alone.
+        if prev_stop == "max_tokens" and text:
+            new_last = (state.get("last_text", "") or "") + text
+        else:
+            new_last = text or state.get("last_text", "")
+
         return {
             "iteration": iteration,
             "stop_reason": stop_reason,
             "pending_tool_calls": tool_calls,
-            "last_text": text or state.get("last_text", ""),
+            "last_text": new_last,
             "input_tokens_total": state.get("input_tokens_total", 0) + in_tok,
             "output_tokens_total": state.get("output_tokens_total", 0) + out_tok,
         }
@@ -307,6 +330,16 @@ class Agent:
         if state.get("stop_reason") == "max_tokens":
             # Truncated text with no tool call: continue generating.
             logger.info("stop_reason=max_tokens; continuing to let the model finish.")
+            return "continue"
+        if state.get("stop_reason") == "tool_use":
+            # The model asked for tools but every tool_use block was malformed
+            # and filtered out in reasoning_node. Rather than emit an empty
+            # answer, re-call the LLM so it can recover. The max_iterations cap
+            # bounds this loop.
+            logger.info(
+                "stop_reason=tool_use with no pending tool calls; "
+                "continuing to let the model recover."
+            )
             return "continue"
         return "output"
 
@@ -384,7 +417,8 @@ class Agent:
         ) as stream:
             for text in stream.text_stream:
                 if self.on_text:
-                    self.on_text(text)
+                    # Best-effort per-chunk redaction of leaked secrets.
+                    self.on_text(redact_secrets(text))
             return stream.get_final_message()
 
     # ------------------------------------------------------------------ #

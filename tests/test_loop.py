@@ -180,8 +180,10 @@ def test_multiple_tool_use_blocks_in_one_response(memory):
     assert len(tool_result_msgs[0]["content"]) == 2
 
 
-def test_malformed_tool_use_is_skipped(memory):
-    # First response has a tool_use block missing its name; should be skipped.
+def test_malformed_tool_use_is_filtered_and_recovers(memory):
+    # First response's ONLY block is a malformed tool_use (name=None). With the
+    # filtering fix it is dropped before persistence, routing returns
+    # "continue", and the agent re-calls the client to recover.
     bad_block = SimpleNamespace(type="tool_use", id="t1", name=None, input={})
     client = FakeClient(
         [
@@ -193,8 +195,71 @@ def test_malformed_tool_use_is_skipped(memory):
     result = agent.run("trigger malformed")
 
     assert result["text"] == "Recovered."
-    # No tool_result should have been injected for the skipped call.
+    # The client was called twice: malformed response, then recovery.
+    assert client.messages.calls == 2
+
     history = memory.get_history()
+    all_blocks = [
+        b
+        for msg in history
+        if isinstance(msg["content"], list)
+        for b in msg["content"]
+        if isinstance(b, dict)
+    ]
+    # No tool_result should have been injected for the filtered call.
+    tool_results = [b for b in all_blocks if b.get("type") == "tool_result"]
+    assert tool_results == []
+    # The malformed tool_use must not appear in history either.
+    malformed = [
+        b
+        for b in all_blocks
+        if b.get("type") == "tool_use" and not b.get("name")
+    ]
+    assert malformed == []
+
+
+def test_max_tokens_text_is_accumulated(memory):
+    # A max_tokens truncation followed by an end_turn continuation should
+    # accumulate both text segments into the final answer.
+    client = FakeClient(
+        [
+            make_message([text_block("part one ")], "max_tokens"),
+            make_message([text_block("part two")], "end_turn"),
+        ]
+    )
+    agent = Agent(memory=memory, settings=fake_settings(), client=client)
+    result = agent.run("write a long answer")
+
+    assert client.messages.calls == 2
+    assert "part one" in result["text"]
+    assert "part two" in result["text"]
+
+
+def test_valid_tool_use_always_gets_tool_result(memory):
+    # A well-formed tool_use followed by a recovery text turn must produce
+    # exactly one tool_result for the single tool_use.
+    client = FakeClient(
+        [
+            make_message(
+                [tool_block("t1", "calculator", {"expression": "2+2"})], "tool_use"
+            ),
+            make_message([text_block("All done.")], "end_turn"),
+        ]
+    )
+    agent = Agent(memory=memory, settings=fake_settings(), client=client)
+    result = agent.run("please compute")
+
+    assert result["text"] == "All done."
+    assert client.messages.calls == 2
+
+    history = memory.get_history()
+    tool_uses = [
+        b
+        for msg in history
+        if isinstance(msg["content"], list)
+        for b in msg["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_use"
+    ]
     tool_results = [
         b
         for msg in history
@@ -202,7 +267,9 @@ def test_malformed_tool_use_is_skipped(memory):
         for b in msg["content"]
         if isinstance(b, dict) and b.get("type") == "tool_result"
     ]
-    assert tool_results == []
+    assert len(tool_uses) == 1
+    assert len(tool_results) == 1
+    assert tool_results[0]["tool_use_id"] == "t1"
 
 
 def test_input_rejected(memory):

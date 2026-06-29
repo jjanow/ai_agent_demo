@@ -16,8 +16,9 @@ recursive summarization), and answers through a streaming Streamlit chat UI.
   limit retries with backoff, `max_tokens` continuation, malformed/empty tool
   result handling, and simultaneous (parallel) tool calls.
 - **Token-budgeted memory** with JSON persistence per session.
-- **Safety guards**: input sanitization, secret redaction, path-traversal
-  rejection, and a calculator expression whitelist.
+- **Safety guards**: input sanitization, secret redaction (including streamed
+  output and tool expanders), path-traversal rejection, sensitive-file denylist
+  for file tools, and an AST-based calculator with exponent caps.
 - **Structured logging** to console and a dated file via loguru.
 - **Streaming Streamlit UI** with a dark theme, tool-call expanders, and live
   token/iteration metrics.
@@ -81,6 +82,7 @@ recursive summarization), and answers through a streaming Streamlit chat UI.
     test_loop.py
     test_tools.py
     test_memory.py
+    test_safety.py
   .env.example
   requirements.txt
   README.md
@@ -108,6 +110,12 @@ ANTHROPIC_MODEL=claude-sonnet-4-6
 MAX_ITERATIONS=10
 TOKEN_BUDGET=80000
 LOG_LEVEL=INFO
+
+# Optional operational overrides (defaults shown)
+# API_TIMEOUT_S=30
+# TOOL_TIMEOUT_S=10
+# MAX_INPUT_CHARS=10000
+# MAX_OUTPUT_TOKENS=4096
 ```
 
 All configuration is read from the environment — nothing is hardcoded.
@@ -138,5 +146,10 @@ are required.
   work may continue briefly in the background.
 - Token counting for the memory budget is a cheap `chars / 4` estimate, not a
   true tokenizer count.
-- The calculator uses `eval` against a restricted namespace with no builtins and
-  a strict character/name whitelist; it is intended for arithmetic only.
+- The calculator parses expressions with an AST whitelist (no `eval`/`exec`),
+  permitting only arithmetic operators and a fixed set of math functions
+  (`sqrt`, `sin`, `cos`, `tan`, `log`, `pow`, `abs`) and constants (`pi`, `e`);
+  exponents are capped to avoid CPU/memory exhaustion.
+- The file tools are restricted to the working directory and additionally deny
+  dotfiles/dotdirs (e.g. `.env`, `.git/`) and private-key/cert files. Output and
+  tool-result displays are scrubbed for anything resembling an API key.
